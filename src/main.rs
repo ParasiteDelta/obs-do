@@ -19,6 +19,18 @@ enum Command {
         #[clap(default_value = "Mic/Aux")]
         input: String,
     },
+    /// Fades from current input volume to specified volume, in db or %, over specified time in seconds.
+    FadeInput {
+      #[clap(default_value = "Mic/Aux")]
+      input: String,
+      #[arg(allow_hyphen_values = true)]
+      volume: String,
+      /// Duration of fade in seconds. Can enter without an 's' on the end.
+      /// 
+      /// If none is provided, defaults to 5 seconds.
+      #[clap(default_value = "5")]
+      duration: String,
+   },
     SetScene {
         scene: String,
     },
@@ -122,6 +134,74 @@ ERROR message:
                 .await
                 .context(format!("toggle-mute {input}"))?;
         }
+        Command::FadeInput { input, volume, duration } => {
+            let mut current_interim_volume: f32;
+            let current_volume: f32;
+            let current_unit: String;
+            let volume_difference: f32;
+            let volume_move_amount: f32;
+            
+            let mut interval = tokio::time::interval(
+                tokio::time::Duration::from_millis(16)
+            );
+            let current_input_volume =
+                client
+                    .inputs()
+                    .volume(&input)
+                    .await
+                    .context(format!("get-current-volume {input}"))?;
+            let final_volume = if let Some(db) = volume.to_lowercase().strip_suffix("db") {
+                current_volume = current_input_volume.db;
+                current_unit = "db".to_string();
+                db.parse().context("ERR: Invalid dB value!\n")?
+            } else {
+                current_volume = current_input_volume.mul;
+                current_unit = "perc".to_string();
+                let volume_percentage = volume.strip_suffix('%').unwrap_or(&volume);
+                volume_percentage.parse::<f32>().context("ERR: Invalid percentage value!\n")? / 100.0
+            };
+            
+            current_interim_volume = current_volume;
+            
+            match current_volume > final_volume {
+                true => {
+                    volume_difference = current_volume - final_volume;
+                    volume_move_amount = volume_difference / (60.0 * duration.parse::<f32>().unwrap());
+                    while current_interim_volume > final_volume {
+                        let packaged_volume = match current_unit.as_str() {
+                            "db" => Volume::Db(current_interim_volume),
+                            "perc" => Volume::Mul(current_interim_volume),
+                            _ => panic!()
+                        };
+                        interval.tick().await;
+                        client
+                            .inputs()
+                            .set_volume(&input, packaged_volume)
+                            .await
+                            .context(format!("set-volume {input}"))?;
+                        current_interim_volume -= volume_move_amount;
+                    }
+                },
+                false => {
+                    volume_difference = final_volume - current_volume;
+                    volume_move_amount = volume_difference / (60.0 * duration.parse::<f32>().unwrap());
+                    while current_interim_volume < final_volume {
+                        let packaged_volume = match current_unit.as_str() {
+                            "db" => Volume::Db(current_interim_volume),
+                            "perc" => Volume::Mul(current_interim_volume),
+                            _ => panic!()
+                        };
+                        interval.tick().await;
+                        client
+                            .inputs()
+                            .set_volume(&input, packaged_volume)
+                            .await
+                            .context(format!("set-volume {input}"))?;
+                        current_interim_volume += volume_move_amount;
+                    }
+                }
+            }
+        }
         Command::SetScene { scene } => {
             client
                 .scenes()
@@ -130,7 +210,7 @@ ERROR message:
                 .with_context(|| format!("set-scene {scene}"))?;
         }
         Command::SetVolume { input, volume } => {
-            let new_volume = if let Some(db) = volume.strip_suffix("dB") {
+            let new_volume = if let Some(db) = volume.to_lowercase().strip_suffix("dB") {
                 Volume::Db(db.parse().context("invalid dB quantity")?)
             } else {
                 let volume = volume.strip_suffix('%').unwrap_or(&volume);
